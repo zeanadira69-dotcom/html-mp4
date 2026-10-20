@@ -19,6 +19,7 @@ const el = {
 let pageHtml = '';
 let audioFile = null;
 let pageAudioFile = null;
+let audioToken = 0;
 let audioDurationSec = 0;
 let busy = false;
 let cancelled = false;
@@ -615,31 +616,29 @@ function refreshAudioInfo() {
   const f = audioFile || pageAudioFile;
   const own = !!audioFile;
   audioDurationSec = 0;
-  el.useAudioDur.disabled = true;
+  const token = ++audioToken;
   if (!f) {
     el.useAudioDur.checked = false;
+    el.useAudioDur.disabled = true;
     el.audioInfo.textContent = 'Tanpa audio, video akan senyap.';
     updateEstimate();
     return;
   }
+  /* Kotak "mengikuti audio" aktif begitu ada audio; durasi pasti dibaca saat render. */
+  el.useAudioDur.disabled = false;
+  if (!own) el.useAudioDur.checked = true;
   const label = own ? f.name : 'audio bawaan halaman (otomatis dipakai)';
   el.audioInfo.textContent = `${label}: membaca durasi...`;
-  const url = URL.createObjectURL(f);
-  const a = new Audio();
-  a.preload = 'metadata';
-  a.onloadedmetadata = () => {
-    audioDurationSec = a.duration || 0;
+  /* Durasi dibaca lewat decode (elemen Audio sering tidak memuat metadata di Chrome Android). */
+  decodeAudio(f).then((buf) => {
+    if (token !== audioToken) return;
+    audioDurationSec = buf.duration || 0;
     el.audioInfo.textContent = `${label} (${fmtTime(audioDurationSec)})`;
-    el.useAudioDur.disabled = !audioDurationSec;
-    if (!own && audioDurationSec) el.useAudioDur.checked = true;
-    URL.revokeObjectURL(url);
     updateEstimate();
-  };
-  a.onerror = () => {
-    el.audioInfo.textContent = `${label} (durasi tidak terbaca, akan dicoba saat render)`;
-    URL.revokeObjectURL(url);
-  };
-  a.src = url;
+  }).catch(() => {
+    if (token !== audioToken) return;
+    el.audioInfo.textContent = `${label} (durasi dibaca saat render)`;
+  });
 }
 
 el.audioFile.addEventListener('change', () => {
