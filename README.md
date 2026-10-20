@@ -10,19 +10,15 @@ Memakai WebCodecs dan [mp4-muxer](https://github.com/Vanilagy/mp4-muxer), jadi h
 4. **Mulai render**, biarkan layar menyala dan tab terbuka.
 5. **Unduh MP4**.
 
-## Dua mode render
-- **Frame demi frame (disarankan):** halaman punya `window.renderFrame(t)`. Hasil mulus, tidak bergantung kecepatan HP.
-- **Real-time:** halaman berjalan sendiri dan direkam apa adanya. Bisa patah-patah kalau HP lambat.
+## Mode render
+- **Otomatis / frame demi frame (disarankan):** perekam mengendalikan waktu halaman (jam virtual: `audio.currentTime`, `performance.now`, `Date.now`, timestamp `requestAnimationFrame`). Halaman yang menghitung gambar dari waktu tetap mulus dan akurat, tanpa perlu diubah. Tombol "Tap to start" ditekan otomatis, dan audio yang tertanam di halaman (`<audio src=...>`) ikut masuk ke MP4.
+- **Real-time:** halaman berjalan sendiri dan direkam apa adanya. Pakai kalau hasil Otomatis tampak diam (misalnya animasi memakai `setTimeout`/`setInterval`). Bisa patah-patah kalau HP lambat.
 
-Kontrak untuk mode frame demi frame (lihat `sample.html`):
-```js
-window.renderFrame = function (t, index, fps) {
-  // gambar SATU frame di <canvas> untuk waktu t (detik), secara sinkron
-};
-```
+Opsional: halaman boleh punya `window.renderFrame(t, index, fps)` yang menggambar satu frame secara sinkron (lihat `sample.html`), maka fungsi itu dipanggil langsung.
 
 ## Batasan
 - Hanya menangkap `<canvas>` (atau `<video>`). Animasi CSS/SVG/DOM biasa belum didukung.
+- Jam virtual belum mengendalikan `setTimeout`/`setInterval`. Kalau gambar tampak diam, tool memberi peringatan; pakai mode Real-time.
 - Audio di-encode AAC. Kalau browser tidak punya AAC, dipakai Opus (sebagian galeri/iPhone bisa tidak memutarnya).
 - Video H.264 memakai encoder bawaan perangkat. Browser tanpa H.264 akan menampilkan pesan error.
 - File disusun di memori, jadi video sangat panjang atau 1080p@60 bisa berat di HP.

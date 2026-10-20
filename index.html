@@ -78,7 +78,7 @@
   <section class="card">
     <h2>2. Audio (opsional)</h2>
     <input type="file" id="audioFile" accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg">
-    <p id="audioInfo" class="hint">Tanpa audio, video akan senyap.</p>
+    <p id="audioInfo" class="hint">Tanpa audio, video akan senyap. Audio yang sudah tertanam di halaman dipakai otomatis.</p>
   </section>
 
   <section class="card">
@@ -121,9 +121,9 @@
       </div>
       <label for="mode">Mode render</label>
       <select id="mode">
-        <option value="auto" selected>Otomatis (disarankan)</option>
-        <option value="realtime">Real-time (rekam saat berjalan)</option>
-        <option value="frame">Frame demi frame (butuh renderFrame)</option>
+        <option value="auto" selected>Otomatis: frame demi frame, jam virtual (disarankan)</option>
+        <option value="frame">Frame demi frame (sama dengan Otomatis)</option>
+        <option value="realtime">Real-time (pakai kalau hasil Otomatis diam)</option>
       </select>
       <div class="grid">
         <div>

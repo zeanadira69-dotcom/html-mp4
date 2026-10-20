@@ -18,6 +18,7 @@ const el = {
 
 let pageHtml = '';
 let audioFile = null;
+let pageAudioFile = null;
 let audioDurationSec = 0;
 let busy = false;
 let cancelled = false;
@@ -176,13 +177,74 @@ function updateButtons() {
 
 /* ---------- halaman HTML ---------- */
 
-function reloadPage() {
+/* Jam virtual: disisipkan sebelum skrip halaman. Saat mode frame demi frame aktif,
+   audio.currentTime, performance.now, Date.now dan timestamp rAF dikendalikan perekam
+   (window.__hm.t, dalam detik), jadi halaman yang bergantung waktu tetap mulus dan akurat.
+   Animasi yang memakai setTimeout/setInterval belum ikut dikendalikan. */
+function makePrelude(virtual) {
+  return `<script>(function(){
+var hm=window.__hm={t:${virtual ? 0 : 'null'}};
+var MP=HTMLMediaElement.prototype,cd=Object.getOwnPropertyDescriptor(MP,'currentTime');
+Object.defineProperty(MP,'currentTime',{configurable:true,
+ get:function(){return hm.t===null?cd.get.call(this):hm.t},
+ set:function(v){if(hm.t===null)cd.set.call(this,v)}});
+if(hm.t!==null){MP.play=function(){return Promise.resolve()};}
+var p0=performance.now.bind(performance),d0=Date.now.bind(Date),e0=d0();
+performance.now=function(){return hm.t===null?p0():hm.t*1000};
+Date.now=function(){return hm.t===null?d0():e0+hm.t*1000};
+var raf=window.requestAnimationFrame.bind(window);
+window.requestAnimationFrame=function(cb){return raf(function(){cb(performance.now())})};
+})();<\/script>`;
+}
+
+function withPrelude(html, virtual) {
+  const tag = makePrelude(virtual);
+  const m = html.match(/<head[^>]*>/i) || html.match(/<html[^>]*>/i);
+  if (m) return html.slice(0, m.index + m[0].length) + tag + html.slice(m.index + m[0].length);
+  return tag + html;
+}
+
+function reloadPage(virtual = false) {
   return new Promise((resolve) => {
     const done = () => { el.frame.removeEventListener('load', done); resolve(); };
     el.frame.addEventListener('load', done);
-    el.frame.srcdoc = pageHtml + `\n<!-- reload ${Date.now()} -->`;
+    el.frame.srcdoc = withPrelude(pageHtml, virtual) + `\n<!-- reload ${Date.now()} -->`;
   });
 }
+
+/* Tekan tombol "mulai" bawaan halaman (mis. overlay "Tap to start") kalau ada. */
+function autoStartPage() {
+  const doc = el.frame.contentDocument;
+  if (!doc) return;
+  try {
+    let btn = doc.querySelector('#go, #start, #play, .start, [data-start]');
+    if (!btn) {
+      const all = [...doc.querySelectorAll('button')];
+      if (all.length === 1) btn = all[0];
+    }
+    if (btn) btn.click();
+  } catch (_) { /* abaikan */ }
+}
+
+/* Ambil audio yang tertanam di halaman (<audio src=...>) supaya ikut masuk ke MP4. */
+async function grabPageAudio() {
+  pageAudioFile = null;
+  const doc = el.frame.contentDocument;
+  if (!doc) return;
+  const a = doc.querySelector('audio');
+  const src = a && (a.currentSrc || a.src || (a.querySelector('source') || {}).src);
+  if (!src) return;
+  try {
+    const r = await el.frame.contentWindow.fetch(src);
+    const b = await r.blob();
+    if (b.size) pageAudioFile = new File([b], 'audio-halaman', { type: b.type || 'audio/mpeg' });
+  } catch (_) { pageAudioFile = null; }
+}
+
+const rafTwice = (win) => Promise.race([
+  new Promise((r) => win.requestAnimationFrame(() => win.requestAnimationFrame(r))),
+  sleep(500),
+]);
 
 async function waitForSource(selector) {
   const t0 = performance.now();
@@ -213,13 +275,17 @@ async function loadPage(html) {
   await reloadPage();
   const src = await waitForSource(el.selector.value.trim());
   const hook = typeof el.frame.contentWindow.renderFrame === 'function';
+  await grabPageAudio();
   if (src) {
     const w = src.width || src.videoWidth;
     const h = src.height || src.videoHeight;
-    el.pageInfo.textContent = `Canvas terdeteksi: ${w}x${h}. Fungsi renderFrame: ${hook ? 'ada (bisa frame demi frame)' : 'tidak ada (mode real-time)'}.`;
+    el.pageInfo.textContent = `Canvas terdeteksi: ${w}x${h}. ` +
+      (hook ? 'Fungsi renderFrame ada.' : 'Tanpa renderFrame, waktu halaman dikendalikan jam virtual.') +
+      (pageAudioFile ? ' Audio halaman terdeteksi.' : '');
   } else {
     el.pageInfo.textContent = 'Canvas belum terdeteksi. Pastikan halaman memakai <canvas>, atau isi selector.';
   }
+  refreshAudioInfo();
   updateButtons();
 }
 
@@ -316,9 +382,10 @@ async function startRender() {
 
     let abuf = null;
     let asel = null;
-    if (audioFile) {
+    const audioSrc = audioFile || pageAudioFile;
+    if (audioSrc) {
       setStatus('Membaca audio...');
-      abuf = await decodeAudio(audioFile);
+      abuf = await decodeAudio(audioSrc);
       asel = await pickAudioConfig(abuf.sampleRate);
       if (!asel) throw new Error('Browser tidak bisa meng-encode audio (AAC/Opus). Hapus audio lalu coba lagi.');
       log(`Audio: ${asel.muxCodec.toUpperCase()}, ${abuf.sampleRate} Hz, ${fmtTime(abuf.duration)}`);
@@ -326,19 +393,17 @@ async function startRender() {
     let duration = cfg.duration;
     if (abuf && cfg.useAudioDur) duration = Math.min(abuf.duration, 1800);
 
+    const mode = cfg.mode === 'realtime' ? 'realtime' : 'frame';
     setStatus('Memuat ulang halaman...');
     layoutStage();
-    await reloadPage();
+    await reloadPage(mode === 'frame');
     const src = await waitForSource(cfg.selector);
     if (!src) throw new Error('Canvas tidak ditemukan di halaman. Pastikan ada <canvas>, atau isi selector.');
     const win = el.frame.contentWindow;
     const hasHook = typeof win.renderFrame === 'function';
-    let mode = cfg.mode;
-    if (mode === 'auto') mode = hasHook ? 'frame' : 'realtime';
-    if (mode === 'frame' && !hasHook) {
-      throw new Error('Mode frame demi frame butuh fungsi window.renderFrame(t) di halaman. Pakai mode Real-time atau Otomatis.');
-    }
-    log(`Mode: ${mode === 'frame' ? 'frame demi frame' : 'real-time'}, ${cfg.W}x${cfg.H} @ ${cfg.fps} fps, ${duration.toFixed(1)} detik`);
+    autoStartPage();
+    await sleep(300);
+    log(`Mode: ${mode === 'frame' ? 'frame demi frame (jam virtual)' : 'real-time'}, ${cfg.W}x${cfg.H} @ ${cfg.fps} fps, ${duration.toFixed(1)} detik`);
 
     const target = new ArrayBufferTarget();
     const muxerOpts = {
@@ -390,14 +455,34 @@ async function startRender() {
       if (vErr) throw vErr;
     };
 
+    const probe = document.createElement('canvas');
+    probe.width = probe.height = 16;
+    const pctx = probe.getContext('2d', { willReadFrequently: true });
+    let sig0 = null;
+    let moved = false;
+    const signature = () => {
+      pctx.drawImage(out, 0, 0, 16, 16);
+      const d = pctx.getImageData(0, 0, 16, 16).data;
+      let s = 0;
+      for (let k = 0; k < d.length; k++) s = (s * 31 + d[k]) | 0;
+      return s;
+    };
+
     setStatus('Merender...');
+    let stillWarn = false;
     if (mode === 'frame') {
       const total = Math.round(duration * cfg.fps);
       for (let i = 0; i < total; i++) {
         checkAbort();
-        win.renderFrame(i / cfg.fps, i, cfg.fps);
+        win.__hm.t = i / cfg.fps;
+        if (hasHook) win.renderFrame(i / cfg.fps, i, cfg.fps);
+        else await rafTwice(win);
         if (audio) audio.feedUntil(i / cfg.fps + 0.5);
         pushFrame(i);
+        if (i % 10 === 0) {
+          const s = signature();
+          if (sig0 === null) sig0 = s; else if (s !== sig0) moved = true;
+        }
         while (venc.encodeQueueSize > 6) {
           await Promise.race([
             new Promise((r) => venc.addEventListener('dequeue', r, { once: true })),
@@ -411,6 +496,7 @@ async function startRender() {
           await yieldNow();
         }
       }
+      stillWarn = !moved && total > 30;
     } else {
       await new Promise((resolve, reject) => {
         const t0 = performance.now();
@@ -444,7 +530,12 @@ async function startRender() {
 
     const blob = new Blob([target.buffer], { type: 'video/mp4' });
     showResult(blob, cfg, asel);
-    setStatus('Selesai. Video siap diunduh.', 'ok');
+    if (stillWarn) {
+      setStatus('Selesai, tetapi gambar tampak tidak bergerak. Coba mode Real-time.', 'bad');
+      log('Peringatan: gambar tidak berubah selama render. Halaman mungkin memakai setTimeout/klik untuk animasi, atau butuh tombol mulai.');
+    } else {
+      setStatus('Selesai. Video siap diunduh.', 'ok');
+    }
   } catch (e) {
     if (e && e.message === 'Dibatalkan') {
       setStatus('Dibatalkan.');
@@ -519,32 +610,42 @@ el.btnSample.addEventListener('click', async () => {
   }
 });
 
-el.audioFile.addEventListener('change', () => {
-  audioFile = el.audioFile.files[0] || null;
+/* Audio yang dipakai: file pilihan pengguna, kalau kosong pakai audio tertanam di halaman. */
+function refreshAudioInfo() {
+  const f = audioFile || pageAudioFile;
+  const own = !!audioFile;
   audioDurationSec = 0;
-  el.useAudioDur.checked = false;
   el.useAudioDur.disabled = true;
-  if (!audioFile) {
+  if (!f) {
+    el.useAudioDur.checked = false;
     el.audioInfo.textContent = 'Tanpa audio, video akan senyap.';
     updateEstimate();
     return;
   }
-  el.audioInfo.textContent = `${audioFile.name}: membaca durasi...`;
-  const url = URL.createObjectURL(audioFile);
+  const label = own ? f.name : 'audio bawaan halaman (otomatis dipakai)';
+  el.audioInfo.textContent = `${label}: membaca durasi...`;
+  const url = URL.createObjectURL(f);
   const a = new Audio();
   a.preload = 'metadata';
   a.onloadedmetadata = () => {
     audioDurationSec = a.duration || 0;
-    el.audioInfo.textContent = `${audioFile.name} (${fmtTime(audioDurationSec)})`;
+    el.audioInfo.textContent = `${label} (${fmtTime(audioDurationSec)})`;
     el.useAudioDur.disabled = !audioDurationSec;
+    if (!own && audioDurationSec) el.useAudioDur.checked = true;
     URL.revokeObjectURL(url);
     updateEstimate();
   };
   a.onerror = () => {
-    el.audioInfo.textContent = `${audioFile.name} (durasi tidak terbaca, akan dicoba saat render)`;
+    el.audioInfo.textContent = `${label} (durasi tidak terbaca, akan dicoba saat render)`;
     URL.revokeObjectURL(url);
   };
   a.src = url;
+}
+
+el.audioFile.addEventListener('change', () => {
+  audioFile = el.audioFile.files[0] || null;
+  el.useAudioDur.checked = false;
+  refreshAudioInfo();
 });
 
 ['fps', 'quality', 'duration', 'useAudioDur'].forEach((id) => el[id].addEventListener('input', updateEstimate));
