@@ -53,6 +53,15 @@ function fmtTime(s) {
   return `${String(m).padStart(2, '0')}:${r.toFixed(1).padStart(4, '0')}`;
 }
 
+function fmtEta(s) {
+  if (!isFinite(s)) return '?';
+  s = Math.round(s);
+  if (s < 60) return `${s} dtk`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} mnt ${s % 60} dtk`;
+  return `${Math.floor(m / 60)} jam ${m % 60} mnt`;
+}
+
 /* ---------- muxer (CDN + cadangan lokal) ---------- */
 
 let muxerModule = null;
@@ -471,6 +480,7 @@ async function startRender() {
 
     setStatus('Merender...');
     let stillWarn = false;
+    const tStart = performance.now();
     if (mode === 'frame') {
       const total = Math.round(duration * cfg.fps);
       for (let i = 0; i < total; i++) {
@@ -493,7 +503,13 @@ async function startRender() {
         }
         if (i % 4 === 0) {
           setProgress(i / total);
-          setStatus(`Merender frame ${i + 1} / ${total}`);
+          const el_s = (performance.now() - tStart) / 1000;
+          const rate = i / Math.max(el_s, 0.001);
+          const eta = (total - i) / Math.max(rate, 0.001);
+          setStatus(`Merender frame ${i + 1} / ${total} | ${rate.toFixed(1)} fps | sisa ${fmtEta(eta)}`);
+          if (i === 40 && eta > 900) {
+            log(`Peringatan: perkiraan sisa ${fmtEta(eta)}. HP ini lambat untuk pengaturan ini. Batalkan, lalu coba 720p, 24 fps, kualitas Hemat, atau durasi lebih pendek.`);
+          }
           await yieldNow();
         }
       }
