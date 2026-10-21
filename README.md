@@ -11,15 +11,18 @@ Memakai WebCodecs dan [mp4-muxer](https://github.com/Vanilagy/mp4-muxer), jadi h
 5. **Unduh MP4**.
 
 ## Mode render
-- **Otomatis / frame demi frame (disarankan):** perekam mengendalikan waktu halaman (jam virtual: `audio.currentTime`, `performance.now`, `Date.now`, timestamp `requestAnimationFrame`). Halaman yang menghitung gambar dari waktu tetap mulus dan akurat, tanpa perlu diubah. Tombol "Tap to start" ditekan otomatis, dan audio yang tertanam di halaman (`<audio src=...>`) ikut masuk ke MP4.
-- **Real-time:** halaman berjalan sendiri dan direkam apa adanya. Pakai kalau hasil Otomatis tampak diam (misalnya animasi memakai `setTimeout`/`setInterval`). Bisa patah-patah kalau HP lambat.
+- **Cepat (real-time, sekitar 1x durasi):** merekam canvas langsung dengan `captureStream` + `MediaRecorder` (encoder bawaan HP), lalu durasi ditulis ke header MP4 supaya galeri tidak menampilkan 00:00. Video 30 detik selesai dalam sekitar 30 detik. Halaman berjalan apa adanya; kalau HP tidak sanggup mencapai fps target, tool memberi peringatan karena hasil bisa patah-patah.
+- **Presisi (frame demi frame):** perekam mengendalikan waktu halaman (jam virtual: `audio.currentTime`, `performance.now`, `Date.now`, timestamp `requestAnimationFrame`) dan meng-encode lewat WebCodecs + mp4-muxer. Selalu mulus dan pas, tetapi lebih lama.
+- **Otomatis:** pakai Cepat kalau browser menghasilkan MP4, kalau tidak pakai Presisi.
+
+Di semua mode, tombol "Tap to start" ditekan otomatis dan audio yang tertanam di halaman (`<audio src=...>`) ikut masuk ke video.
 
 Opsional: halaman boleh punya `window.renderFrame(t, index, fps)` yang menggambar satu frame secara sinkron (lihat `sample.html`), maka fungsi itu dipanggil langsung.
 
 ## Batasan
 - Hanya menangkap `<canvas>` (atau `<video>`). Animasi CSS/SVG/DOM biasa belum didukung.
-- Jam virtual belum mengendalikan `setTimeout`/`setInterval`. Kalau gambar tampak diam, tool memberi peringatan; pakai mode Real-time.
-- Audio di-encode AAC. Kalau browser tidak punya AAC, dipakai Opus (sebagian galeri/iPhone bisa tidak memutarnya).
+- Jam virtual (mode Presisi) belum mengendalikan `setTimeout`/`setInterval`. Kalau gambar tampak diam, tool memberi peringatan; pakai mode Cepat.
+- Mode Cepat memakai codec pilihan browser (idealnya H.264 + AAC). Kalau browser hanya bisa VP9/Opus atau WebM, sebagian galeri/iPhone atau aplikasi bisa menolak; pakai mode Presisi.
 - Video H.264 memakai encoder bawaan perangkat. Browser tanpa H.264 akan menampilkan pesan error.
 - File disusun di memori, jadi video sangat panjang atau 1080p@60 bisa berat di HP.
 

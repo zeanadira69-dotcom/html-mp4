@@ -120,9 +120,13 @@ async function pickAudioConfig(sampleRate) {
 }
 
 async function checkSupport() {
+  const rec = pickRecorderMime();
+  const recLine = !rec ? 'Mode Cepat (MediaRecorder): TIDAK didukung'
+    : rec.startsWith('video/mp4') ? 'Mode Cepat: MP4 didukung'
+    : 'Mode Cepat: hanya WebM (Otomatis memakai mode Presisi)';
   if (!('VideoEncoder' in window) || !('VideoFrame' in window)) {
-    el.support.className = 'badge bad';
-    el.support.textContent = 'Browser ini belum mendukung WebCodecs. Pakai Chrome terbaru (Android atau desktop).';
+    el.support.className = 'badge ' + (rec.startsWith('video/mp4') ? 'warn' : 'bad');
+    el.support.textContent = 'Mode Presisi (WebCodecs): tidak didukung browser ini. Pakai Chrome terbaru.\n' + recLine;
     return;
   }
   const v = await pickVideoConfig(1280, 720, 30, 4e6);
@@ -130,6 +134,7 @@ async function checkSupport() {
   const lines = [];
   lines.push(v ? `Video H.264: didukung (${v.codec})` : 'Video H.264: TIDAK didukung');
   lines.push(a ? `Audio: ${a.muxCodec.toUpperCase()} didukung` : 'Audio: TIDAK bisa di-encode (video tetap bisa, tanpa audio)');
+  lines.push(recLine);
   el.support.textContent = lines.join('\n');
   el.support.className = 'badge ' + (v && a ? 'ok' : v ? 'warn' : 'bad');
   if (a && a.muxCodec === 'opus') {
@@ -366,7 +371,12 @@ function makeAudioFeeder(buf, duration, muxer, config) {
 async function startRender() {
   if (busy) return;
   if (!pageHtml) { setStatus('Muat halaman HTML dulu.', 'bad'); return; }
-  if (!('VideoEncoder' in window)) { setStatus('Browser tidak mendukung WebCodecs.', 'bad'); return; }
+
+  const cfg = readConfig();
+  const recMime = pickRecorderMime();
+  const useFast = cfg.mode === 'fast' || (cfg.mode === 'auto' && recMime.startsWith('video/mp4'));
+  if (useFast && !recMime) { setStatus('Browser tidak mendukung perekaman cepat (MediaRecorder). Pakai mode Presisi.', 'bad'); return; }
+  if (!useFast && !('VideoEncoder' in window)) { setStatus('Browser tidak mendukung WebCodecs. Pakai mode Cepat.', 'bad'); return; }
 
   busy = true;
   cancelled = false;
@@ -375,13 +385,14 @@ async function startRender() {
   el.log.textContent = '';
   setProgress(0);
 
-  const cfg = readConfig();
   let wake = null;
   let venc = null;
   let audio = null;
 
   try {
     try { wake = await navigator.wakeLock?.request('screen'); } catch (_) { /* tidak wajib */ }
+
+    if (useFast) { await renderFast(cfg, recMime); return; }
 
     setStatus('Menyiapkan encoder...');
     const { Muxer, ArrayBufferTarget } = await loadMuxer();
@@ -403,17 +414,16 @@ async function startRender() {
     let duration = cfg.duration;
     if (abuf && cfg.useAudioDur) duration = Math.min(abuf.duration, 1800);
 
-    const mode = cfg.mode === 'realtime' ? 'realtime' : 'frame';
     setStatus('Memuat ulang halaman...');
     layoutStage();
-    await reloadPage(mode === 'frame');
+    await reloadPage(true);
     const src = await waitForSource(cfg.selector);
     if (!src) throw new Error('Canvas tidak ditemukan di halaman. Pastikan ada <canvas>, atau isi selector.');
     const win = el.frame.contentWindow;
     const hasHook = typeof win.renderFrame === 'function';
     autoStartPage();
     await sleep(300);
-    log(`Mode: ${mode === 'frame' ? 'frame demi frame (jam virtual)' : 'real-time'}, ${cfg.W}x${cfg.H} @ ${cfg.fps} fps, ${duration.toFixed(1)} detik`);
+    log(`Mode: Presisi (frame demi frame, jam virtual), ${cfg.W}x${cfg.H} @ ${cfg.fps} fps, ${duration.toFixed(1)} detik`);
 
     const target = new ArrayBufferTarget();
     const muxerOpts = {
@@ -481,7 +491,7 @@ async function startRender() {
     setStatus('Merender...');
     let stillWarn = false;
     const tStart = performance.now();
-    if (mode === 'frame') {
+    {
       const total = Math.round(duration * cfg.fps);
       for (let i = 0; i < total; i++) {
         checkAbort();
@@ -514,28 +524,6 @@ async function startRender() {
         }
       }
       stillWarn = !moved && total > 30;
-    } else {
-      await new Promise((resolve, reject) => {
-        const t0 = performance.now();
-        let last = -1;
-        const step = () => {
-          try {
-            checkAbort();
-            const elapsed = (performance.now() - t0) / 1000;
-            if (elapsed >= duration) { resolve(); return; }
-            const idx = Math.floor(elapsed * cfg.fps);
-            if (idx > last && venc.encodeQueueSize < 10) {
-              if (audio) audio.feedUntil(elapsed + 0.5);
-              pushFrame(idx);
-              last = idx;
-            }
-            setProgress(elapsed / duration);
-            setStatus(`Merekam ${elapsed.toFixed(1)} / ${duration.toFixed(1)} detik`);
-            requestAnimationFrame(step);
-          } catch (e) { reject(e); }
-        };
-        requestAnimationFrame(step);
-      });
     }
 
     setStatus('Menyelesaikan file...');
@@ -548,7 +536,7 @@ async function startRender() {
     const blob = new Blob([target.buffer], { type: 'video/mp4' });
     showResult(blob, cfg, asel);
     if (stillWarn) {
-      setStatus('Selesai, tetapi gambar tampak tidak bergerak. Coba mode Real-time.', 'bad');
+      setStatus('Selesai, tetapi gambar tampak tidak bergerak. Coba mode Cepat.', 'bad');
       log('Peringatan: gambar tidak berubah selama render. Halaman mungkin memakai setTimeout/klik untuk animasi, atau butuh tombol mulai.');
     } else {
       setStatus('Selesai. Video siap diunduh.', 'ok');
@@ -569,6 +557,208 @@ async function startRender() {
   }
 }
 
+/* ---------- Mode Cepat: captureStream + MediaRecorder (real-time, sekitar 1x durasi) ---------- */
+
+function pickRecorderMime() {
+  if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) return '';
+  const list = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  for (const m of list) {
+    try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (_) { /* coba berikutnya */ }
+  }
+  return '';
+}
+
+/* MP4 dari MediaRecorder tidak punya durasi di header (galeri menampilkan 00:00).
+   Fungsi ini menulis durasi ke mvhd, tkhd, mdhd, dan mehd. Mengembalikan jumlah kotak yang diubah. */
+function fixMp4Duration(buf, sec) {
+  const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let movieTs = 1000;
+  let found = 0;
+  const setDur = (body, ver, ts, off32, off64) => {
+    const val = Math.round(sec * ts);
+    if (ver === 1) v.setBigUint64(body + off64, BigInt(val)); else v.setUint32(body + off32, val >>> 0);
+    found++;
+  };
+  const walk = (start, end) => {
+    let p = start;
+    while (p + 8 <= end) {
+      let size = v.getUint32(p);
+      const type = String.fromCharCode(buf[p + 4], buf[p + 5], buf[p + 6], buf[p + 7]);
+      let hdr = 8;
+      if (size === 1) { size = Number(v.getBigUint64(p + 8)); hdr = 16; } else if (size === 0) { size = end - p; }
+      if (size < 8 || p + size > end) break;
+      const body = p + hdr;
+      const ver = buf[body];
+      if (type === 'moov' || type === 'trak' || type === 'mdia' || type === 'mvex') {
+        walk(body, p + size);
+      } else if (type === 'mvhd') {
+        if (ver === 1) { movieTs = v.getUint32(body + 20); setDur(body, 1, movieTs, 0, 24); }
+        else { movieTs = v.getUint32(body + 12); setDur(body, 0, movieTs, 16, 0); }
+      } else if (type === 'mdhd') {
+        const ts = ver === 1 ? v.getUint32(body + 20) : v.getUint32(body + 12);
+        if (ver === 1) setDur(body, 1, ts, 0, 24); else setDur(body, 0, ts, 16, 0);
+      } else if (type === 'tkhd') {
+        if (ver === 1) setDur(body, 1, movieTs, 0, 28); else setDur(body, 0, movieTs, 20, 0);
+      } else if (type === 'mehd') {
+        if (ver === 1) setDur(body, 1, movieTs, 0, 4); else setDur(body, 0, movieTs, 4, 0);
+      }
+      p += size;
+    }
+  };
+  walk(0, buf.byteLength);
+  return found;
+}
+
+function paintFit(ctx, src, W, H, fit) {
+  const sw = src.width || src.videoWidth;
+  const sh = src.height || src.videoHeight;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  if (!sw || !sh) return;
+  let dw = W;
+  let dh = H;
+  if (fit !== 'stretch') {
+    const s = fit === 'cover' ? Math.max(W / sw, H / sh) : Math.min(W / sw, H / sh);
+    dw = sw * s;
+    dh = sh * s;
+  }
+  ctx.drawImage(src, (W - dw) / 2, (H - dh) / 2, dw, dh);
+}
+
+async function renderFast(cfg, mime) {
+  let rec = null;
+  let ac = null;
+  let bsrc = null;
+  let painting = false;
+  try {
+    /* audio: file pilihan pengguna, kalau kosong audio bawaan halaman */
+    const audioSrc = audioFile || pageAudioFile;
+    let abuf = null;
+    let duration = cfg.duration;
+    if (audioSrc) {
+      setStatus('Membaca audio...');
+      abuf = await decodeAudio(audioSrc);
+      if (cfg.useAudioDur) duration = Math.min(abuf.duration, 1800);
+    }
+    log(`Mode: Cepat (real-time), ${cfg.W}x${cfg.H} @ ${cfg.fps} fps, ${duration.toFixed(1)} detik, ${mime.split(';')[0]}`);
+
+    setStatus('Memuat ulang halaman...');
+    layoutStage();
+    await reloadPage(false);
+    const src = await waitForSource(cfg.selector);
+    if (!src) throw new Error('Canvas tidak ditemukan di halaman. Pastikan ada <canvas>, atau isi selector.');
+    const win = el.frame.contentWindow;
+    const doc = el.frame.contentDocument;
+    const pageAudioEl = doc.querySelector('audio');
+    if (pageAudioEl) pageAudioEl.muted = true; /* suara masuk ke video lewat file audio, bukan speaker */
+
+    /* video: tangkap canvas sumber langsung kalau ukurannya sama, kalau beda lewat canvas perantara */
+    const sw = src.width || src.videoWidth;
+    const sh = src.height || src.videoHeight;
+    let vstream;
+    if (sw === cfg.W && sh === cfg.H) {
+      vstream = src.captureStream(cfg.fps);
+    } else {
+      const out = document.createElement('canvas');
+      out.width = cfg.W;
+      out.height = cfg.H;
+      const octx = out.getContext('2d', { alpha: false });
+      vstream = out.captureStream(cfg.fps);
+      painting = true;
+      let lastPaint = 0;
+      const paintLoop = (now) => {
+        if (!painting) return;
+        if (now - lastPaint >= 1000 / cfg.fps - 3) { paintFit(octx, src, cfg.W, cfg.H, cfg.fit); lastPaint = now; }
+        requestAnimationFrame(paintLoop);
+      };
+      paintFit(octx, src, cfg.W, cfg.H, cfg.fit);
+      requestAnimationFrame(paintLoop);
+    }
+
+    const tracks = [...vstream.getVideoTracks()];
+    if (abuf) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ac = new AC();
+      const dest = ac.createMediaStreamDestination();
+      bsrc = ac.createBufferSource();
+      bsrc.buffer = abuf;
+      bsrc.connect(dest);
+      tracks.push(...dest.stream.getAudioTracks());
+      try { await ac.resume(); } catch (_) { /* abaikan */ }
+    }
+
+    let recErr = null;
+    const chunks = [];
+    rec = new MediaRecorder(new MediaStream(tracks), {
+      mimeType: mime, videoBitsPerSecond: cfg.bitrate, audioBitsPerSecond: 128000,
+    });
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    rec.onerror = (e) => { recErr = (e && e.error) || new Error('MediaRecorder error'); };
+    const stopped = new Promise((r) => { rec.onstop = r; });
+
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+    setStatus('Merekam...');
+    rec.start(250);
+    autoStartPage();
+    if (bsrc) bsrc.start();
+    const t0 = performance.now();
+    let ticks = 0;
+    const countTick = () => { ticks++; win.requestAnimationFrame(countTick); };
+    win.requestAnimationFrame(countTick);
+
+    await new Promise((resolve, reject) => {
+      const timer = setInterval(() => {
+        try {
+          if (cancelled) throw new Error('Dibatalkan');
+          if (recErr) throw recErr;
+          const t = (performance.now() - t0) / 1000;
+          setProgress(t / duration);
+          setStatus(`Merekam ${t.toFixed(1)} / ${duration.toFixed(1)} detik`);
+          if (t >= duration + 0.1) { clearInterval(timer); resolve(); }
+        } catch (e) { clearInterval(timer); reject(e); }
+      }, 100);
+    });
+    const elapsed = (performance.now() - t0) / 1000;
+    painting = false;
+    setStatus('Menyelesaikan file...');
+    setProgress(1);
+    rec.stop();
+    await stopped;
+    if (recErr) throw recErr;
+
+    const type = (rec.mimeType || mime || 'video/webm').split(';')[0];
+    const isMp4 = type.includes('mp4');
+    let blob = new Blob(chunks, { type });
+    if (isMp4) {
+      try {
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const n = fixMp4Duration(bytes, elapsed);
+        log(`Durasi ditulis ke header MP4 (${n} kotak): ${elapsed.toFixed(2)} detik`);
+        blob = new Blob([bytes], { type });
+      } catch (e) { log('Gagal menulis durasi: ' + (e.message || e)); }
+    }
+
+    const fpsMeasured = ticks / Math.max(elapsed, 0.001);
+    log(`Halaman berjalan rata-rata ${fpsMeasured.toFixed(1)} fps selama perekaman`);
+    const mt = (rec.mimeType || mime).toLowerCase();
+    const acodec = mt.includes('mp4a') ? 'AAC' : mt.includes('opus') ? 'Opus' : 'audio';
+    log(`Format perekam: ${rec.mimeType || mime}`);
+    showResult(blob, cfg, abuf ? { muxCodec: acodec } : null, isMp4 ? 'mp4' : 'webm');
+    if (fpsMeasured < cfg.fps * 0.9) {
+      setStatus(`Selesai, tetapi halaman hanya ${fpsMeasured.toFixed(0)} fps (target ${cfg.fps}), hasil bisa patah-patah. Coba mode Presisi atau 720p.`, 'bad');
+    } else if (!isMp4) {
+      setStatus('Selesai (format WebM). Durasi di galeri bisa tidak terbaca. Pakai mode Presisi untuk MP4.', 'ok');
+    } else {
+      setStatus('Selesai. Video siap diunduh.', 'ok');
+    }
+  } finally {
+    painting = false;
+    try { if (rec && rec.state !== 'inactive') rec.stop(); } catch (_) { /* abaikan */ }
+    try { if (bsrc) bsrc.stop(); } catch (_) { /* abaikan */ }
+    try { if (ac) await ac.close(); } catch (_) { /* abaikan */ }
+  }
+}
+
 /* ---------- hasil ---------- */
 
 function resetResult() {
@@ -579,10 +769,10 @@ function resetResult() {
   lastBlob = null;
 }
 
-function showResult(blob, cfg, asel) {
+function showResult(blob, cfg, asel, ext = 'mp4') {
   lastBlob = blob;
   lastUrl = URL.createObjectURL(blob);
-  const name = `html-mp4-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.mp4`;
+  const name = `html-mp4-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.${ext}`;
   const mb = (blob.size / 1048576).toFixed(1);
   el.result.hidden = false;
   el.resultInfo.textContent = `Ukuran ${mb} MB. Membaca durasi...`;
@@ -593,7 +783,7 @@ function showResult(blob, cfg, asel) {
   el.video.src = lastUrl;
   el.btnDownload.href = lastUrl;
   el.btnDownload.download = name;
-  const file = new File([blob], name, { type: 'video/mp4' });
+  const file = new File([blob], name, { type: blob.type || 'video/mp4' });
   el.btnShare.hidden = !(navigator.canShare && navigator.canShare({ files: [file] }));
   el.btnShare.onclick = () => navigator.share({ files: [file], title: name }).catch(() => {});
   el.result.scrollIntoView({ behavior: 'smooth', block: 'start' });
